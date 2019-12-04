@@ -11,9 +11,7 @@ Author vokrut--42Robotics
 
 # Commented out IPython magic to ensure Python compatibility.
 #Import required frameworks
-
 import math
-
 from IPython import display
 from matplotlib import cm
 from matplotlib import gridspec
@@ -28,8 +26,9 @@ import tensorflow as tf
 from tensorflow.python.data import Dataset
 from pandas.io.json import json_normalize
 import json
-from tensorflow import keras
-from tensorflow.keras import layers
+import keras
+from keras import layers
+
 from google.colab import drive
 drive.mount('/content/drive')
 
@@ -39,7 +38,19 @@ quantum_data = pd.read_json("drive/My Drive/qc/01/3125_random_5_qubit_circuits.j
 
 # quantum_data.shape
 
-def gate_data_preproc(quantum_data, gate_num):
+def gate_data_preproc(quantum_data: dict,
+                      gate_num: int) -> pd.DataFrame:
+  """
+  Function takes the raw data as a .json file, split the data into two parts, 
+  the first 32 columns represent state vectors the last 173 colums represent
+  the parameters of each gate.
+
+  Parameters: quantum_data: dict - the raw data read from .json file
+              gate_num: int - current gate number from the range from  1 to 40
+  Returns:    a new pandas dataframe with separated values of the statevectors and
+              gate's parameters
+
+  """
   #since we care only about the value of the angles in U3 Gate, check for this type of gate
   #if the gate is not a U3 gate, set the angle values to 0
   is_not_u3gate = lambda data: data["Gate_Type"] != 'U3Gate'
@@ -65,7 +76,6 @@ def gate_data_preproc(quantum_data, gate_num):
   return dataframe
 
 norm_qdata = json_normalize(quantum_data['statevector'])
-# print(qdata.head())
 #iterate in data set. where key represent a gate number on each iteration
 for key in quantum_data:
   # print(key)
@@ -81,15 +91,24 @@ for key in quantum_data:
 norm_qdata
 # norm_qdata.shape
 
-#Define and store the input features
-
-def preprocess_features(quantum_data):
-  #define features
-  selected_features = quantum_data.filter(regex='^(?!state)', axis=1) #!define later
+def preprocess_features(quantum_data: pd.DataFrame) -> pd.DataFrame:
+  """
+  Define and store the input features.
+  Parameters:   normalized dataframe
+  Returns:      features, e.g. last 173 colums of the dataframe as a pandas
+                dataframe type
+  """
+  selected_features = quantum_data.filter(regex='^(?!state)', axis=1) 
   return selected_features
 
-#define and store the target
-def preprocess_targets(quantum_data):
+def preprocess_targets(quantum_data: pd.DataFrame) -> pd.DataFrame:
+  """
+  Define and store the targets
+  Parameters:   normalized dataframe
+  Returns:      targets, e.g. first 32 colums of the dataframe as a Pandas
+                Dataframe object
+  """
+
   output_targets = pd.DataFrame()
   output_targets = quantum_data.filter(regex='^state', axis=1) 
   output_targets /= 1024
@@ -118,10 +137,12 @@ layer1 = layers.Dense(1024, activation='relu')(inputs)
 layer2 = layers.Dense(512, activation='relu')(layer1)
 
 #third layer with 256 units, activation function is relu
-layer3 = layers.Dense(525612, activation='relu')(layer2)
+layer3 = layers.Dense(256, activation='relu')(layer2)
+
 #output layer activation function is softmax
 outputs = layers.Dense(32, activation='softmax')(layer3)
 
+#define the keras model
 model = keras.Model(inputs=inputs, outputs=outputs, name='predict_statevector')
 
 # Let's check out what the model summary looks like:
@@ -129,7 +150,7 @@ model = keras.Model(inputs=inputs, outputs=outputs, name='predict_statevector')
 model.summary()
 keras.utils.plot_model(model, 'my_first_model.png')
 
-#set training data. For now, takes only first 100 items from the data set. Increase the size later
+#set training data. For now, takes only first 2000 items from the data set. Increase the size later
 training_feature = preprocess_features(norm_qdata.head(2000))
 training_target = preprocess_targets(norm_qdata.head(2000))
 
@@ -140,49 +161,117 @@ validating_target = preprocess_targets(norm_qdata.tail(100))
 print(training_feature.shape)
 print(training_target.shape)
 
-def my_log_error_fn(predict, actual):
-  # raws = predict.K.shape[0]
-  raws = predict.shape[0]
-  col = predict.shape[1]
-  it = np.nditer([predict, actual])
-  err = 0.0
-  with it:
-    for (x, y) in it:
-      err += (y*np.log(x) + (1 - y)*np.log(1 - x))
-
-  return -err / ( col * raws)
-
 #after data preprocessing and defining nn, compile the model
-model.compile(loss='mse',
+#as a loss function uses categorical-crossentropy
+#adam optimizer and accuract as metrics
+#categorical_crossentropy
+
+model.compile(loss='mean_squared_logarithmic_error',
               optimizer='adam',
               metrics=['accuracy'])
 
-#train the model on specidied data. Save log for later to see the result in Tensorboard
+#@title
 
-logdir = "logs/scalars/" + datetime.now().strftime("%Y%m%d-%H%M%S")
-tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir)
+import os
+from tensorflow.keras.callbacks import TensorBoard
 
-training_history = model.fit(training_feature,
-                             training_target, 
-                             batch_size=32,
-                             epoch=1,
+class TrainValTensorBoard(TensorBoard):
+    """
+    keras tensorboard: plot train and validation scalars in a same figure
+    https://stackoverflow.com/questions/47877475/keras-tensorboard-plot-train-and-validation-scalars-in-a-same-figure
+    To handle the validation logs with a separate writer, you can write a custom callback that wraps around the original TensorBoard methods.
+    """
+
+    def __init__(self, log_dir='./logs', **kwargs):
+        # Make the original `TensorBoard` log to a subdirectory 'training'
+        training_log_dir = os.path.join(log_dir, 'training')
+        super(TrainValTensorBoard, self).__init__(training_log_dir, **kwargs)
+
+        # Log the validation metrics to a separate subdirectory
+        self.val_log_dir = os.path.join(log_dir, 'validation')
+
+    def set_model(self, model):
+        # Setup writer for validation metrics
+        self.val_writer = tf.summary.FileWriter(self.val_log_dir)
+        super(TrainValTensorBoard, self).set_model(model)
+
+    def on_epoch_end(self, epoch, logs=None):
+        # Pop the validation logs and handle them separately with
+        # `self.val_writer`. Also rename the keys so that they can
+        # be plotted on the same figure with the training metrics
+        logs = logs or {}
+        val_logs = {k.replace('val_', ''): v for k, v in logs.items() if k.startswith('val_')}
+        for name, value in val_logs.items():
+            summary = tf.Summary()
+            summary_value = summary.value.add()
+            summary_value.simple_value = value.item()
+            summary_value.tag = name
+            self.val_writer.add_summary(summary, epoch)
+        self.val_writer.flush()
+
+        # Pass the remaining logs to `TensorBoard.on_epoch_end`
+        logs = {k: v for k, v in logs.items() if not k.startswith('val_')}
+        super(TrainValTensorBoard, self).on_epoch_end(epoch, logs)
+
+    def on_train_end(self, logs=None):
+        super(TrainValTensorBoard, self).on_train_end(logs)
+        self.val_writer.close()
+
+# Clear any logs from previous runs
+!rm -rf ./logs
+
+logdir = "logs"
+tensorboard_callback = keras.callbacks.TensorBoard(log_dir=logdir, histogram_freq=50, write_graph=True, write_images=True)
+
+#train the model on specidied data. Save logs for later to see the result
+#in Tensorboard using callbacks
+
+training_history = model.fit(x=training_feature,
+                             y=training_target, 
+                             batch_size=16,
+                             nb_epoch=25,
                              verbose=2,
                              validation_data=(validating_feature, validating_target),
-                             callbacks=[tensorboard_callback])
+                             callbacks=[TrainValTensorBoard(write_graph=False)])
+                            #  callbacks=[TensorBoardColabCallback(tbc)])
 
 # Commented out IPython magic to ensure Python compatibility.
-# %tensorboard --logdir logs/scalars
+# %tensorboard --logdir logs/
 
-model.evaluate(x=validating_feature, y=validating_target, batch_size=32, verbose=2)
-model.metrics_names
-# history = model.fit_generator(
-#         train_generator,
-#         steps_per_epoch=train_generator.n/batch_size,
-#         epochs=10)
+plt.plot(training_history.history['loss'])
+plt.plot(training_history.history['val_loss'])
+plt.title('Model loss')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['Train', 'Test'], loc='upper left')
+plt.show()
 
-# plt.plot(history.history['loss'])
-# plt.title('loss')
-# plt.ylabel('loss')
-# plt.xlabel('epoch')
-# plt.legend(['loss'], loc='upper left')
-# plt.show()
+#save the model
+# The SavedModel files that were created contain:
+#         A TensorFlow checkpoint containing the model weights.
+#         A SavedModel proto containing the underlying TensorFlow graph.
+
+# path = 'logs/my_keras_model.h5'
+model.save('model_dir/my_keras_model.h5')
+
+#retrieves the weights values as a list of Numpy arrays vie get_weights()
+#set the state of the model via set_weights
+
+saved_weights = model.get_weights()
+model.set_weights(saved_weights)
+
+# Recreate the exact same model
+path = 'model_dir/my_new_model.h5'
+new_model = keras.models.load_model(path)
+predictions = model.predict(validating_feature)
+# Check that the state is preserved
+# This file includes:
+#   The model's architecture
+#   The model's weight values (which were learned during training)
+#   The model's training config (what you passed to compile), if any
+#   The optimizer and its state, if any (this enables you to restart training where you left off)
+new_predictions = new_model.predict(validating_feature)
+np.testing.assert_allclose(predictions, new_predictions, rtol=1e-6, atol=1e-6)
+
+# Clear any logs from previous runs
+!rm -rf ./logs
